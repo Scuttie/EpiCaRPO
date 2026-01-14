@@ -1,0 +1,36 @@
+# 가상환경
+.verl_env/
+venv/
+.venv/
+env/
+virtualenv.pyz
+
+# Core dump
+core.*
+core
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+*.egg-info/
+
+# 실행 로그 (불필요)
+nohup.out
+outputs/
+wandb/
+logs/
+*.log
+
+# 모델/체크포인트
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+checkpoints/
+
+# 기타
+.DS_Store
+*.tmp
