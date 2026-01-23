@@ -68,6 +68,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+from sklearn.metrics import roc_auc_score, brier_score_loss
 
 @dataclass
 class ResourcePoolManager:
@@ -635,6 +636,248 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _compute_calibration_metrics(self, confidences: np.ndarray, labels: np.ndarray) -> dict:
+        """Compute calibration metrics: AUROC, ECE, Brier Score.
+        
+        Args:
+            confidences: Model confidence scores (P(correct)), shape (N,)
+            labels: Binary labels (1=correct, 0=incorrect), shape (N,)
+        
+        Returns:
+            Dictionary with calibration metrics
+        """
+        metrics = {}
+        
+        # Filter out NaN values
+        valid_mask = ~(np.isnan(confidences) | np.isnan(labels))
+        confidences = confidences[valid_mask]
+        labels = labels[valid_mask]
+        
+        if len(confidences) == 0:
+            return {"val-calibration/auroc": float('nan'), 
+                    "val-calibration/ece": float('nan'), 
+                    "val-calibration/brier": float('nan')}
+        
+        # AUROC
+        try:
+            if len(np.unique(labels)) > 1:
+                auroc = roc_auc_score(labels, confidences)
+            else:
+                auroc = float('nan')
+        except Exception:
+            auroc = float('nan')
+        metrics["val-calibration/auroc"] = auroc
+        
+        # Brier Score
+        try:
+            brier = brier_score_loss(labels, confidences)
+        except Exception:
+            brier = float('nan')
+        metrics["val-calibration/brier"] = brier
+        
+        # ECE (Expected Calibration Error)
+        try:
+            n_bins = 10
+            bin_boundaries = np.linspace(0, 1, n_bins + 1)
+            ece = 0.0
+            for i in range(n_bins):
+                bin_lower, bin_upper = bin_boundaries[i], bin_boundaries[i + 1]
+                if i == 0:
+                    in_bin = (confidences >= bin_lower) & (confidences <= bin_upper)
+                else:
+                    in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+                prop_in_bin = np.mean(in_bin)
+                if prop_in_bin > 0:
+                    acc_in_bin = np.mean(labels[in_bin])
+                    avg_conf_in_bin = np.mean(confidences[in_bin])
+                    ece += np.abs(avg_conf_in_bin - acc_in_bin) * prop_in_bin
+        except Exception:
+            ece = float('nan')
+        metrics["val-calibration/ece"] = ece
+        
+        return metrics
+
+
+    def _compute_verification_confidence(self, test_batch: DataProto) -> tuple[np.ndarray, np.ndarray]:
+        """Compute self-verification confidence for each sample in the batch.
+        
+        Uses P(Yes) / (P(Yes) + P(No)) formula where the model is asked
+        "Is the answer correct? A) Yes B) No"
+        
+        Args:
+            test_batch: DataProto containing prompts, responses, and correctness labels
+        
+        Returns:
+            confidences: Array of confidence scores
+            labels: Array of binary correctness labels
+        """
+        VERBALIZATION_CONFIG = {
+            "injection": "\nIs the answer correct? Choose ONLY one letter. A) Yes B) No. Your choice:",
+            "token_yes": " A",  # token_id: 362
+            "token_no": " B",   # token_id: 425
+        }
+        
+        # Get token IDs
+        token_yes_id = self.tokenizer(VERBALIZATION_CONFIG["token_yes"], add_special_tokens=False).input_ids[0]
+        token_no_id = self.tokenizer(VERBALIZATION_CONFIG["token_no"], add_special_tokens=False).input_ids[0]
+        
+        batch_size = test_batch.batch["prompts"].shape[0]
+        prompts = test_batch.batch["prompts"]
+        responses = test_batch.batch["responses"]
+        
+        # Get correctness labels from reward scores
+        if "token_level_scores" in test_batch.batch.keys():
+            scores = test_batch.batch["token_level_scores"].sum(dim=-1).cpu().numpy()
+        else:
+            # If no scores available, return empty
+            return np.array([]), np.array([])
+        
+        threshold = 0.5
+        labels = (scores >= threshold).astype(float)
+        
+        # Build verification prompts
+        verification_input_ids_list = []
+        verification_prompts_list = []
+        verification_responses_yes_list = []
+        verification_responses_no_list = []
+        verification_attn_mask_list = []
+        
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        
+        for i in range(batch_size):
+            # Decode question and solution
+            q_text = self.tokenizer.decode(prompts[i], skip_special_tokens=True)
+            s_text = self.tokenizer.decode(responses[i], skip_special_tokens=True)
+            
+            # Build verification prompt
+            user_content = (
+                f"Question: {q_text}\n\n"
+                f"Solution: {s_text}\n\n"
+                f"{VERBALIZATION_CONFIG['injection']}"
+            )
+            
+            # Apply chat template if available
+            if hasattr(self.tokenizer, "apply_chat_template"):
+                messages = [{"role": "user", "content": user_content}]
+                full_prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                full_prompt = f"User: {user_content}\nAssistant:"
+            
+            # Tokenize
+            prompt_ids = self.tokenizer(full_prompt, add_special_tokens=False).input_ids
+            
+            # Truncate if too long
+            max_len = self.config.data.get("max_prompt_length", 4096) - 1
+            if len(prompt_ids) > max_len:
+                prompt_ids = prompt_ids[-max_len:]
+            
+            verification_prompts_list.append(torch.tensor(prompt_ids, dtype=torch.long))
+            verification_responses_yes_list.append(torch.tensor([token_yes_id], dtype=torch.long))
+            verification_responses_no_list.append(torch.tensor([token_no_id], dtype=torch.long))
+        
+        if len(verification_prompts_list) == 0:
+            return np.array([]), np.array([])
+        
+        # Pad sequences for batch processing
+        from torch.nn.utils.rnn import pad_sequence
+        
+        # Pad prompts (left padding for causal LM)
+        max_prompt_len = max(len(p) for p in verification_prompts_list)
+        padded_prompts = []
+        for p in verification_prompts_list:
+            pad_len = max_prompt_len - len(p)
+            padded_prompts.append(torch.cat([torch.full((pad_len,), pad_token_id, dtype=torch.long), p]))
+        padded_prompts = torch.stack(padded_prompts)
+        
+        # Create input_ids for " A" case: prompt + " A"
+        responses_yes = torch.stack([torch.tensor([token_yes_id], dtype=torch.long) for _ in range(batch_size)])
+        input_ids_yes = torch.cat([padded_prompts, responses_yes], dim=1)
+        attn_mask_yes = (input_ids_yes != pad_token_id).long()
+        position_ids_yes = torch.cumsum(attn_mask_yes, dim=1) - 1
+        position_ids_yes.masked_fill_(attn_mask_yes == 0, 0)
+        
+        # Create input_ids for " B" case: prompt + " B"
+        responses_no = torch.stack([torch.tensor([token_no_id], dtype=torch.long) for _ in range(batch_size)])
+        input_ids_no = torch.cat([padded_prompts, responses_no], dim=1)
+        attn_mask_no = (input_ids_no != pad_token_id).long()
+        position_ids_no = torch.cumsum(attn_mask_no, dim=1) - 1
+        position_ids_no.masked_fill_(attn_mask_no == 0, 0)
+        
+        # Create DataProto for " A" case
+        from tensordict import TensorDict
+        batch_yes = TensorDict({
+            "input_ids": input_ids_yes,
+            "attention_mask": attn_mask_yes,
+            "position_ids": position_ids_yes,
+            "responses": responses_yes,
+        }, batch_size=[batch_size])
+        
+        data_yes = DataProto(
+            batch=batch_yes,
+            non_tensor_batch={"multi_modal_inputs": np.array([{}] * batch_size, dtype=object)},
+        )
+        data_yes.meta_info = {
+            "micro_batch_size": self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu or 8,
+            "temperature": 1.0,  # Use temperature=1 for proper probability
+            "use_dynamic_bsz": False,
+            "pad_token_id": pad_token_id,
+        }
+        
+        # Create DataProto for " B" case
+        batch_no = TensorDict({
+            "input_ids": input_ids_no,
+            "attention_mask": attn_mask_no,
+            "position_ids": position_ids_no,
+            "responses": responses_no,
+        }, batch_size=[batch_size])
+        
+        data_no = DataProto(
+            batch=batch_no,
+            non_tensor_batch={"multi_modal_inputs": np.array([{}] * batch_size, dtype=object)},
+        )
+        data_no.meta_info = {
+            "micro_batch_size": self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu or 8,
+            "temperature": 1.0,
+            "use_dynamic_bsz": False,
+            "pad_token_id": pad_token_id,
+        }
+        
+        # Compute log probabilities using actor
+        try:
+            # Pad to divisor for distributed processing
+            size_divisor = self.actor_rollout_wg.world_size
+            
+            data_yes_padded, pad_size_yes = pad_dataproto_to_divisor(data_yes, size_divisor)
+            data_no_padded, pad_size_no = pad_dataproto_to_divisor(data_no, size_divisor)
+            
+            # Compute log_prob for " A"
+            output_yes = self.actor_rollout_wg.compute_log_prob(data_yes_padded)
+            output_yes = unpad_dataproto(output_yes, pad_size=pad_size_yes)
+            log_prob_yes = output_yes.batch["old_log_probs"][:, -1].cpu().numpy()  # Last token log prob
+            
+            # Compute log_prob for " B"
+            output_no = self.actor_rollout_wg.compute_log_prob(data_no_padded)
+            output_no = unpad_dataproto(output_no, pad_size=pad_size_no)
+            log_prob_no = output_no.batch["old_log_probs"][:, -1].cpu().numpy()
+            
+            # Compute confidence: P(A) / (P(A) + P(B))
+            # Using log-sum-exp for numerical stability
+            log_probs = np.stack([log_prob_yes, log_prob_no], axis=1)  # (batch_size, 2)
+            max_log_prob = np.max(log_probs, axis=1, keepdims=True)
+            exp_log_probs = np.exp(log_probs - max_log_prob)
+            probs = exp_log_probs / np.sum(exp_log_probs, axis=1, keepdims=True)
+            confidences = probs[:, 0]  # P(A) = P(Yes)
+            
+            return confidences, labels
+            
+        except Exception as e:
+            print(f"Error computing verification confidence: {e}")
+            import traceback
+            traceback.print_exc()
+            return np.array([]), np.array([])
+
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -646,6 +889,9 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        
+        # ★★★ 수정: data_source별로 calibration metrics 수집 ★★★
+        calibration_data_by_source: dict[str, dict] = defaultdict(lambda: {"confidences": [], "labels": []})
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -707,7 +953,6 @@ class RayPPOTrainer:
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
-            # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
@@ -717,6 +962,9 @@ class RayPPOTrainer:
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
+            
+            # token_level_scores를 test_batch에 저장 (verification confidence 계산용)
+            test_batch.batch["token_level_scores"] = reward_tensor
 
             reward_extra_infos_dict["reward"].extend(scores)
             reward_extra_info = result.get("reward_extra_info", {})
@@ -732,7 +980,22 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            # ★★★ data_source 추출 ★★★
+            batch_data_sources = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            data_source_lst.append(batch_data_sources)
+            
+            # ★★★ Verification Confidence 계산 (data_source별로 저장) ★★★
+            if self.config.trainer.get("compute_calibration_metrics", True):
+                try:
+                    confidences, labels = self._compute_verification_confidence(test_batch)
+                    if len(confidences) > 0:
+                        # data_source별로 분리하여 저장
+                        for i, (conf, label) in enumerate(zip(confidences, labels)):
+                            ds = batch_data_sources[i] if i < len(batch_data_sources) else "unknown"
+                            calibration_data_by_source[ds]["confidences"].append(conf)
+                            calibration_data_by_source[ds]["labels"].append(label)
+                except Exception as e:
+                    print(f"Warning: Failed to compute verification confidence: {e}")
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -749,6 +1012,9 @@ class RayPPOTrainer:
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
+            # score/pred는 calibration용이므로 검증 스킵
+            if key_info in ["score", "pred"]:
+                continue
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         if merged:
@@ -759,8 +1025,53 @@ class RayPPOTrainer:
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
+        
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        reward_extra_infos_dict.pop("score", None)
+        reward_extra_infos_dict.pop("pred", None)
+
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        
+        # ★★★ Calibration metrics 계산 (data_source별로) ★★★
+        if self.config.trainer.get("compute_calibration_metrics", True):
+            all_confidences = []
+            all_labels = []
+            
+            for data_source, data in calibration_data_by_source.items():
+                if len(data["confidences"]) > 0:
+                    confidences = np.array(data["confidences"])
+                    labels = np.array(data["labels"])
+                    
+                    # Aggregate for overall metrics
+                    all_confidences.extend(data["confidences"])
+                    all_labels.extend(data["labels"])
+                    
+                    # Per-dataset calibration metrics
+                    ds_metrics = self._compute_calibration_metrics(confidences, labels)
+                    for metric_name, metric_val in ds_metrics.items():
+                        # e.g., val-calibration/math/auroc, val-calibration/amc23/ece
+                        new_key = metric_name.replace("val-calibration/", f"val-calibration/{data_source}/")
+                        metric_dict[new_key] = metric_val
+                    
+                    print(f"Calibration [{data_source}]: AUROC={ds_metrics.get('val-calibration/auroc', 'N/A'):.4f}, "
+                        f"ECE={ds_metrics.get('val-calibration/ece', 'N/A'):.4f}, "
+                        f"Brier={ds_metrics.get('val-calibration/brier', 'N/A'):.4f}")
+            
+            # Overall (aggregated) calibration metrics
+            if len(all_confidences) > 0:
+                overall_metrics = self._compute_calibration_metrics(
+                    np.array(all_confidences), 
+                    np.array(all_labels)
+                )
+                for metric_name, metric_val in overall_metrics.items():
+                    new_key = metric_name.replace("val-calibration/", "val-calibration/overall/")
+                    metric_dict[new_key] = metric_val
+                
+                print(f"Calibration [overall]: AUROC={overall_metrics.get('val-calibration/auroc', 'N/A'):.4f}, "
+                    f"ECE={overall_metrics.get('val-calibration/ece', 'N/A'):.4f}, "
+                    f"Brier={overall_metrics.get('val-calibration/brier', 'N/A'):.4f}")
+        
+        return metric_dict
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -816,115 +1127,94 @@ class RayPPOTrainer:
     def init_workers(self):
         """Initialize distributed training workers using Ray backend."""
         self.resource_pool_manager.create_resource_pool()
-
-        # 리소스 풀별 클래스 저장소 초기화
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # 1. Actor/Rollout 워커 설정
-        # 현재 mapping에 등록된 실제 role을 가져옵니다.
-        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        # use_reference_policy가 True이고 LoRA가 아니면 role을 "actor_rollout_ref"로 설정해야 함
+        if Role.ActorRolloutRef in self.role_worker_mapping:
+            actor_role = Role.ActorRolloutRef
+        elif Role.ActorRollout in self.role_worker_mapping:
+            actor_role = Role.ActorRollout
+        else:
+            raise ValueError("Neither ActorRolloutRef nor ActorRollout in role_worker_mapping")
+        
+        # ★★★ 핵심 수정: use_reference_policy && !ref_in_actor 일 때 role 결정 ★★★
+        if self.use_reference_policy and not self.ref_in_actor:
+            # 별도 ref 워커가 필요한 경우 -> actor_rollout_ref role 사용
+            worker_role_str = "actor_rollout_ref"
+        else:
+            worker_role_str = "actor_rollout"
         
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
-            
-            # [수정] Worker 초기화 시 role을 문자열로 변환하여 전달 (AssertionError 방지)
-            # Enum 객체(int)를 문자열 리스트 검증 로직에 맞게 변환합니다.
-            if actor_role == Role.ActorRolloutRef:
-                role_str = "actor_rollout_ref"
-            elif actor_role == Role.ActorRollout:
-                role_str = "actor_rollout"
-            else:
-                role_str = "actor"
-
-            # RayClassWithInitArgs 생성
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
                 config=self.config.actor_rollout_ref,
-                role=role_str,  # [수정] Enum 대신 문자열 전달
+                role=worker_role_str,  # ★ 동적으로 결정된 role
             )
-            
-            # 엔진 내부 base.py의 검색 로직을 통과시키기 위해 
-            # ActorRollout과 ActorRolloutRef 두 가지 키 모두에 동일한 클래스를 할당합니다.
-            self.resource_pool_to_cls[resource_pool][Role.ActorRollout] = actor_rollout_cls
-            self.resource_pool_to_cls[resource_pool][Role.ActorRolloutRef] = actor_rollout_cls
+            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
             raise NotImplementedError
 
         # 2. Critic 워커 설정
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            
-            critic_cfg = self.config.critic
-            # [수정] Critic도 문자열 role 전달
             critic_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.Critic], 
-                config=critic_cfg, 
-                role="critic"  # [수정] Enum 대신 문자열 "critic" 전달
+                config=self.config.critic,
             )
-            self.resource_pool_to_cls[resource_pool][Role.Critic] = critic_cls
+            self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
 
-        # 3. Ray Worker Group 생성 (all_wg)
+        # 3. Reference Policy 워커 설정은 불필요 (actor_rollout_ref가 ref도 처리)
+        # use_legacy_worker_impl="auto"에서는 ActorRolloutRefWorker가 ref 역할도 수행
+
+        # 4. Ray Worker Group 생성
         all_wg = {}
-        for resource_pool, role_to_cls in self.resource_pool_to_cls.items():
-            if not role_to_cls:
-                continue
-            
-            # [수정] Fused Engine 최적화: 모든 역할이 동일한 워커 클래스 객체를 가리키는지 확인
-            # 이를 통해 불필요한 Colocated Worker 래핑과 메서드 이름 변경을 방지합니다.
-            first_cls_arg = next(iter(role_to_cls.values()))
-            is_same_worker = all(v is first_cls_arg for v in role_to_cls.values())
-
-            if is_same_worker:
-                # Case A: Fused Worker (하나의 워커가 여러 역할을 수행)
-                # 별도의 변환 없이 원본 클래스 설정 객체를 그대로 전달
-                ray_cls_with_init = first_cls_arg
-            else:
-                # Case B: Colocated Workers (서로 다른 워커를 하나의 프로세스에 묶음)
-                # Role.value가 int일 경우 TypeError가 발생하므로 str()로 변환하여 키 생성
-                role_to_cls_str = {str(k.value): v for k, v in role_to_cls.items()}
-                ray_cls_with_init = create_colocated_worker_cls(class_dict=role_to_cls_str)
-
-            # [공통] 결정된 ray_cls_with_init을 인자로 전달하여 NoneType 에러 방지
-            worker_group = self.ray_worker_group_cls(
+        wg_kwargs = {"device_name": self.device_name}
+        
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool, 
-                role_to_cls=role_to_cls,  # 기존 호환성 유지
-                ray_cls_with_init=ray_cls_with_init # 수정된 클래스 전달
+                ray_cls_with_init=worker_dict_cls, 
+                **wg_kwargs
             )
-            
-            for role_obj in role_to_cls:
-                all_wg[role_obj] = worker_group
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
 
-        # 4. 각 워커 할당 및 모델 초기화
+        # 5. 각 워커 할당 및 모델 초기화
         if self.use_critic:
-            self.critic_wg = all_wg.get(Role.Critic)
-            if self.critic_wg:
-                self.critic_wg.init_model()
+            self.critic_wg = all_wg['critic']
+            self.critic_wg.init_model()
 
-        # Actor & Rollout 초기화 (둘 중 하나라도 있으면 가져옴)
-        self.actor_rollout_wg = all_wg.get(Role.ActorRollout) or all_wg.get(Role.ActorRolloutRef)
-        if self.actor_rollout_wg:
-            self.actor_rollout_wg.init_model()
+        self.actor_rollout_wg = all_wg['actor_rollout']
+        self.actor_rollout_wg.init_model()
 
-        # Reference Policy 설정
-        if self.ref_in_actor:
+        # ★★★ use_reference_policy=True && !ref_in_actor 일 때, 
+        # actor_rollout_wg가 ref 역할도 수행하므로 ref_policy_wg = actor_rollout_wg ★★★
+        if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
-        else:
-            self.ref_policy_wg = all_wg.get(Role.RefPolicy) or self.actor_rollout_wg
-            
-        # 5. Async Rollout Manager 설정
+
+        # 6. Async Rollout Manager 설정
         self.async_rollout_mode = False
         agent_config = self.config.actor_rollout_ref.rollout.get("agent", None)
         if agent_config is not None and agent_config.get("enable", False):
             self.async_rollout_mode = True
+            
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
         if manager_class_fqn:
-            from verl.utils.import_utils import load_class_from_fqn
             AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
         else:
             from verl.experimental.agent_loop import AgentLoopManager
 
-        rm_rp = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if (self.config.reward_model.enable and self.config.reward_model.enable_resource_pool) else None
-        self.async_rollout_manager = AgentLoopManager(config=self.config, worker_group=self.actor_rollout_wg, rm_resource_pool=rm_rp)
+        rm_rp = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if (
+            self.config.reward_model.enable and self.config.reward_model.enable_resource_pool
+        ) else None
+        self.async_rollout_manager = AgentLoopManager(
+            config=self.config, 
+            worker_group=self.actor_rollout_wg, 
+            rm_resource_pool=rm_rp
+        )
         
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1229,7 +1519,15 @@ class RayPPOTrainer:
             old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
+            print(f"[DEBUG _compute_old_log_prob] Calling actor_rollout_wg.compute_log_prob")
+            print(f"[DEBUG _compute_old_log_prob] batch size: {batch.batch.batch_size}")
+            print(f"[DEBUG _compute_old_log_prob] batch keys: {list(batch.batch.keys())}")
+            
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            
+            print(f"[DEBUG _compute_old_log_prob] old_log_prob: {old_log_prob}")
+            print(f"[DEBUG _compute_old_log_prob] old_log_prob type: {type(old_log_prob)}")
+            
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
@@ -1299,7 +1597,7 @@ class RayPPOTrainer:
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
-    def _pad_and_concat(self, batch1: "DataProto", batch2: "DataProto") -> "DataProto":
+    def _pad_and_concat(self, batch1: DataProto, batch2: DataProto) -> DataProto:
         """Concatenates two DataProtos with padding for different sequence lengths."""
         pad_token_id = self.tokenizer.pad_token_id or 0
 
@@ -1319,51 +1617,104 @@ class RayPPOTrainer:
                 return torch.nn.functional.pad(t, (0, 0, 0, diff), value=pad_val)
             return t
 
-        # Get batch sizes
         batch1_size = self._get_batch_size(batch1)
         batch2_size = self._get_batch_size(batch2)
         
-        # Get all keys
-        keys = set(batch1.batch.keys()) | set(batch2.batch.keys())
+        def get_seq_len(batch, key):
+            if key in batch.batch.keys():
+                t = batch.batch[key]
+                if isinstance(t, torch.Tensor) and t.dim() >= 2:
+                    return t.shape[1]
+            return 0
         
-        # Calculate max sequence length
-        max_seq_len = max(
-            batch1.batch['input_ids'].shape[1] if 'input_ids' in batch1.batch.keys() else 0,
-            batch2.batch['input_ids'].shape[1] if 'input_ids' in batch2.batch.keys() else 0
-        )
+        # ★★★ 핵심: response 관련 키와 total sequence 키 분리 ★★★
+        response_keys = ['responses', 'response_mask', 'token_level_scores', 
+                         'token_level_rewards', 'old_log_probs', 'ref_log_prob', 
+                         'advantages', 'returns']
+        total_seq_keys = ['input_ids', 'attention_mask', 'position_ids']
+        prompt_keys = ['prompts']
+        
+        # 각 카테고리별 최대 길이 계산
+        max_response_len = 0
+        for key in response_keys:
+            max_response_len = max(max_response_len, get_seq_len(batch1, key), get_seq_len(batch2, key))
+        
+        max_total_len = 0
+        for key in total_seq_keys:
+            max_total_len = max(max_total_len, get_seq_len(batch1, key), get_seq_len(batch2, key))
+        
+        max_prompt_len = 0
+        for key in prompt_keys:
+            max_prompt_len = max(max_prompt_len, get_seq_len(batch1, key), get_seq_len(batch2, key))
+        
+        keys = set(batch1.batch.keys()) | set(batch2.batch.keys())
 
-        # Pad tensors
         for k in keys:
+            # 패딩 값 결정
+            if k in ['input_ids', 'responses', 'prompts']:
+                pad_val = pad_token_id
+            elif k in ['attention_mask', 'response_mask']:
+                pad_val = 0
+            elif k in ['token_level_scores', 'token_level_rewards', 'advantages', 
+                       'returns', 'old_log_probs', 'ref_log_prob']:
+                pad_val = 0.0
+            else:
+                pad_val = 0
+            
+            # target 길이 결정
+            if k in response_keys:
+                target_len = max_response_len
+            elif k in total_seq_keys:
+                target_len = max_total_len
+            elif k in prompt_keys:
+                target_len = max_prompt_len
+            else:
+                target_len = max(get_seq_len(batch1, k), get_seq_len(batch2, k))
+                if target_len == 0:
+                    continue
+            
+            # batch1 처리
             if k not in batch1.batch.keys():
-                ref = batch2.batch[k]
-                if isinstance(ref, torch.Tensor):
-                    shape = (batch1_size, *ref.shape[1:])
-                    batch1.batch[k] = torch.zeros(shape, dtype=ref.dtype, device=ref.device)
-                continue
+                ref = batch2.batch.get(k)
+                if ref is not None and isinstance(ref, torch.Tensor):
+                    if ref.dim() >= 2:
+                        shape = (batch1_size, target_len) + ref.shape[2:]
+                    else:
+                        shape = (batch1_size,) + ref.shape[1:]
+                    batch1.batch[k] = torch.full(shape, pad_val, dtype=ref.dtype, device=ref.device)
+            else:
+                batch1.batch[k] = pad_tensor(batch1.batch[k], target_len, pad_val)
             
+            # batch2 처리
             if k not in batch2.batch.keys():
-                ref = batch1.batch[k]
-                if isinstance(ref, torch.Tensor):
-                    shape = (batch2_size, *ref.shape[1:])
-                    batch2.batch[k] = torch.zeros(shape, dtype=ref.dtype, device=ref.device)
-                continue
-            
-            v1 = batch1.batch[k]
-            v2 = batch2.batch[k]
-            
-            if isinstance(v1, torch.Tensor) and v1.dim() >= 2:
-                pad_val = pad_token_id if k in ['input_ids', 'responses', 'prompts'] else 0
-                batch1.batch[k] = pad_tensor(v1, max_seq_len, pad_val)
-                batch2.batch[k] = pad_tensor(v2, max_seq_len, pad_val)
+                ref = batch1.batch.get(k)
+                if ref is not None and isinstance(ref, torch.Tensor):
+                    if ref.dim() >= 2:
+                        shape = (batch2_size, target_len) + ref.shape[2:]
+                    else:
+                        shape = (batch2_size,) + ref.shape[1:]
+                    batch2.batch[k] = torch.full(shape, pad_val, dtype=ref.dtype, device=ref.device)
+            else:
+                batch2.batch[k] = pad_tensor(batch2.batch[k], target_len, pad_val)
 
-        # Sync non-tensor batch keys
+        # Sync non-tensor batch keys with proper default values
         for k in set(batch1.non_tensor_batch.keys()) - set(batch2.non_tensor_batch.keys()):
-            batch2.non_tensor_batch[k] = np.array([None] * batch2_size, dtype=object)
-        for k in set(batch2.non_tensor_batch.keys()) - set(batch1.non_tensor_batch.keys()):
-            batch1.non_tensor_batch[k] = np.array([None] * batch1_size, dtype=object)
+            ref = batch1.non_tensor_batch[k]
+            if k == 'num_turns':
+                # num_turns는 1로 기본값 설정
+                batch2.non_tensor_batch[k] = np.array([1] * batch2_size, dtype=ref.dtype if hasattr(ref, 'dtype') else np.int64)
+            else:
+                batch2.non_tensor_batch[k] = np.array([None] * batch2_size, dtype=object)
                 
+        for k in set(batch2.non_tensor_batch.keys()) - set(batch1.non_tensor_batch.keys()):
+            ref = batch2.non_tensor_batch[k]
+            if k == 'num_turns':
+                batch1.non_tensor_batch[k] = np.array([1] * batch1_size, dtype=ref.dtype if hasattr(ref, 'dtype') else np.int64)
+            else:
+                batch1.non_tensor_batch[k] = np.array([None] * batch1_size, dtype=object)
+                    
         return DataProto.concat([batch1, batch2])
-
+                    
     def _generate_verification_batch(self, batch: DataProto) -> Optional[DataProto]:
         """
         Generates 'Is it correct?' verification data based on the rollout results.
@@ -1371,6 +1722,8 @@ class RayPPOTrainer:
         """
         prompts = batch.batch['prompts']
         responses = batch.batch['responses']
+
+        n_samples = batch.batch['input_ids'].shape[0]
         
         # Assume Outcome Reward: sum of token_level_scores indicates correctness
         if "token_level_scores" not in batch.batch.keys():
@@ -1457,7 +1810,7 @@ class RayPPOTrainer:
         # Assign fixed reward 1.0 to the correct token positions for SFT-like training
         token_level_scores = padded_resp_mask.float() * 1.0
 
-        batch_dict = {
+        batch_dict = TensorDict({
             "input_ids": padded_input_ids,
             "attention_mask": padded_attn,
             "position_ids": position_ids,
@@ -1465,23 +1818,39 @@ class RayPPOTrainer:
             "responses": padded_responses,
             "response_mask": padded_resp_mask,
             "token_level_scores": token_level_scores
-        }
+        }, batch_size=[n_samples])
 
-        # Create Non-tensor batch with specific tag
+        # non_tensor_batch 생성
         non_tensor_batch = {
-            "uid": np.array([str(uuid.uuid4()) for _ in range(found_count)], dtype=object),
-            "data_source": np.array(["verification"] * found_count, dtype=object),  # TAGGING
+            'data_source': np.array(['verification'] * n_samples, dtype=object),
         }
-        # Fill missing keys from original batch
-        for k in batch.non_tensor_batch.keys():
-            if k not in non_tensor_batch:
-                non_tensor_batch[k] = np.array([None] * found_count, dtype=object)
-
-        return DataProto(
-            batch=TensorDict(batch_dict, batch_size=found_count),
+        
+        # 원본 batch의 모든 non_tensor_batch 키에 대해 기본값 설정
+        for key in batch.non_tensor_batch.keys():
+            if key == 'data_source':
+                continue
+            elif key == 'num_turns':
+                non_tensor_batch[key] = np.array([1] * n_samples, dtype=np.int64)
+            elif key in ['uid', 'index', 'extra_info']:
+                non_tensor_batch[key] = np.array([f'verif_{i}' for i in range(n_samples)], dtype=object)
+            else:
+                ref = batch.non_tensor_batch[key]
+                if hasattr(ref, 'dtype'):
+                    if np.issubdtype(ref.dtype, np.integer):
+                        non_tensor_batch[key] = np.zeros(n_samples, dtype=ref.dtype)
+                    elif np.issubdtype(ref.dtype, np.floating):
+                        non_tensor_batch[key] = np.zeros(n_samples, dtype=ref.dtype)
+                    else:
+                        non_tensor_batch[key] = np.array([None] * n_samples, dtype=object)
+                else:
+                    non_tensor_batch[key] = np.array([None] * n_samples, dtype=object)
+        
+        verification_batch = DataProto(
+            batch=batch_dict,
             non_tensor_batch=non_tensor_batch,
-            meta_info=deepcopy(batch.meta_info)
         )
+        
+        return verification_batch
 
     def fit(self):
         """
@@ -1656,7 +2025,7 @@ class RayPPOTrainer:
                                 batch, reward_fn=self.reward_fn, return_dict=False
                             )
 
-                        # Ensure token_level_scores is set for the merged batch logic
+                        # Ensure token_level_scores is set
                         batch.batch["token_level_scores"] = reward_tensor
 
                         # =============================================================================
@@ -1667,32 +2036,6 @@ class RayPPOTrainer:
                         if "data_source" not in batch.non_tensor_batch:
                             batch.non_tensor_batch["data_source"] = np.array(["rl"] * batch_size, dtype=object)
 
-                        if self.config.trainer.get("use_verification_task", False):
-                            verif_batch = self._generate_verification_batch(batch)
-                            
-                            if verif_batch is not None:
-                                verif_count = self._get_batch_size(verif_batch)
-                                batch = self._pad_and_concat(batch, verif_batch)
-                                metrics["verification/count"] = verif_count
-                                reward_tensor = batch.batch["token_level_scores"]
-                            else:
-                                metrics["verification/count"] = 0
-
-                        if reward_extra_infos_dict:
-                            # Robust update: only update indices that correspond to the original RL batch if merged
-                            # Or rely on `_pad_and_concat` initialization.
-                            current_bsz = batch.batch.batch_size[0]
-                            dict_bsz = len(next(iter(reward_extra_infos_dict.values())))
-                            
-                            if dict_bsz == current_bsz:
-                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-                            elif dict_bsz < current_bsz:
-                                # We merged verification data, so we need to update only the first part
-                                for k, v in reward_extra_infos_dict.items():
-                                    full_arr = batch.non_tensor_batch.get(k, np.array([None]*current_bsz, dtype=object))
-                                    full_arr[:dict_bsz] = np.array(v)
-                                    batch.non_tensor_batch[k] = full_arr
-
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -1702,37 +2045,73 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # Compute rollout correction (only in decoupled mode)
                         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            and not bypass_recomputing_logprobs
                         ):
                             from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
-                            # Compute IS weights, apply rejection sampling, compute metrics
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        # ★★★ 핵심 수정: Advantage 계산 순서 변경 ★★★
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                        if self.config.trainer.get("use_verification_task", False):
+                            # 1. Original batch의 advantage 먼저 계산 (GRPO)
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+                            
+                            # 2. Verification batch 생성
+                            verif_batch = self._generate_verification_batch(batch)
+                            
+                            if verif_batch is not None:
+                                verif_count = self._get_batch_size(verif_batch)
+                                
+                                # 3. Verification batch의 advantages 직접 설정 (SFT-like: 고정 1.0)
+                                verif_batch.batch['token_level_rewards'] = verif_batch.batch['token_level_scores'].clone()
+                                verif_batch.batch['advantages'] = verif_batch.batch['token_level_scores'].clone()
+                                verif_batch.batch['returns'] = verif_batch.batch['token_level_scores'].clone()
+                                
+                                # 4. 합치기 (둘 다 advantage 계산 완료 상태)
+                                batch = self._pad_and_concat(batch, verif_batch)
+                                metrics["verification/count"] = verif_count
+                            else:
+                                metrics["verification/count"] = 0
+                        else:
+                            # Baseline: 기존대로 advantage 계산
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+
+                        # reward_extra_infos_dict 업데이트
+                        if reward_extra_infos_dict:
+                            current_bsz = batch.batch.batch_size[0]
+                            dict_bsz = len(next(iter(reward_extra_infos_dict.values())))
+                            
+                            if dict_bsz == current_bsz:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            elif dict_bsz < current_bsz:
+                                for k, v in reward_extra_infos_dict.items():
+                                    full_arr = batch.non_tensor_batch.get(k, np.array([None]*current_bsz, dtype=object))
+                                    full_arr[:dict_bsz] = np.array(v)
+                                    batch.non_tensor_batch[k] = full_arr
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1751,6 +2130,22 @@ class RayPPOTrainer:
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
+                            
+                            # ★★★ Shape 맞추기 추가 ★★★
+                            if entropys.shape[1] != response_masks.shape[1]:
+                                target_len = response_masks.shape[1]
+                                curr_len = entropys.shape[1]
+                                if curr_len < target_len:
+                                    # 패딩 추가
+                                    entropys = torch.nn.functional.pad(entropys, (0, target_len - curr_len), value=0.0)
+                                    old_log_prob.batch["old_log_probs"] = torch.nn.functional.pad(
+                                        old_log_prob.batch["old_log_probs"], (0, target_len - curr_len), value=0.0
+                                    )
+                                else:
+                                    # 트렁케이션
+                                    entropys = entropys[:, :target_len]
+                                    old_log_prob.batch["old_log_probs"] = old_log_prob.batch["old_log_probs"][:, :target_len]
+                            
                             actor_config = self.config.actor_rollout_ref.actor
                             entropy_agg = agg_loss(
                                 loss_mat=entropys,
