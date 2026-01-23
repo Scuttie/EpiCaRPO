@@ -41,6 +41,9 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
+    # Convert numpy string to Python string
+    data_source = str(data_source)
+
     if data_source == "openai/gsm8k":
         from . import gsm8k
 
@@ -49,14 +52,7 @@ def default_compute_score(
         from . import math_reward
 
         res = math_reward.compute_score(solution_str, ground_truth)
-        # [Optional] Math-Verify Integration
-        # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
-        # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
-        # To use it, override the `compute_score` function with the following implementation:
-
-        # from . import math_verify
-        # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+    elif data_source in ["math_dapo", "math", "math_dapo_reasoning", "TianHongZXY/amc23", "TianHongZXY/AIME2025"] or data_source.startswith("aime"):
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
