@@ -23,7 +23,7 @@ import math
 import os
 import pickle
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, List, Dict, Any
 
 import numpy as np
 import ray
@@ -198,15 +198,23 @@ def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str
     return tensor_dict1
 
 
-def list_of_dict_to_dict_of_list(list_of_dict: list[dict]):
-    if len(list_of_dict) == 0:
-        return {}
-    keys = list_of_dict[0].keys()
-    output = {key: [] for key in keys}
-    for data in list_of_dict:
-        for key, item in data.items():
-            assert key in output
-            output[key].append(item)
+def list_of_dict_to_dict_of_list(list_of_dict):
+    output = {}
+    for d in list_of_dict:
+        for key, value in d.items():
+            if key not in output:
+                output[key] = []
+            output[key].append(value)
+    
+    # 모든 dict에 동일한 키가 있는지 검증 (더 관대하게 수정)
+    # 키가 없으면 None으로 채움
+    all_keys = set(output.keys())
+    for i, d in enumerate(list_of_dict):
+        for key in all_keys:
+            if key not in d:
+                # 키가 없으면 None 추가
+                output[key][i] = None if i < len(output[key]) else None
+
     return output
 
 
@@ -924,25 +932,102 @@ class DataProto:
         """
         return [self[i : i + split_size] for i in range(0, len(self), split_size)]
 
-    @staticmethod
-    def concat(data: list["DataProto"]) -> "DataProto":
-        """Concat a list of DataProto. The batch is concatenated among dim=0.
-        The meta_info is merged, with special handling for metrics from different workers.
+    @classmethod
+    def concat(cls, data: List["DataProto"]) -> "DataProto":
+        """Concatenate multiple DataProto into one."""
+        
+        data = [d for d in data if d.batch is not None and 'input_ids' in d.batch and d.batch['input_ids'].shape[0] > 0]
 
-        Args:
-            data (List[DataProto]): list of DataProto
-
-        Returns:
-            DataProto: concatenated DataProto
-        """
+        if len(data) == 0:
+            # 모두 빈 배치면 None 반환 (caller가 처리)
+            return cls(batch=None, non_tensor_batch={}, meta_info={})
+                
+        # 디버깅
+        print(f"[DEBUG concat] Number of batches to concat: {len(data)}")
+        for i, d in enumerate(data):
+            if d.batch is not None and 'input_ids' in d.batch:
+                batch_size = d.batch['input_ids'].shape[0]
+            else:
+                batch_size = 0
+            ntb_sizes = {k: len(v) if hasattr(v, '__len__') else 'scalar' for k, v in d.non_tensor_batch.items()}
+            print(f"[DEBUG concat] Batch {i}: tensor batch_size={batch_size}, non_tensor_batch sizes: {ntb_sizes}")
+        
+        # ===== tensor batch concat =====
         batch_lst = []
-        for batch in data:
-            batch_lst.append(batch.batch)
-        new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
+        has_valid_batch = False
+        for d in data:
+            if d.batch is not None and 'input_ids' in d.batch and d.batch['input_ids'].shape[0] > 0:
+                batch_lst.append(d.batch)
+                has_valid_batch = True
+        
+        if not has_valid_batch:
+            # 모든 배치가 비어있음: 첫 번째 배치의 구조를 가진 빈 TensorDict 생성
+            print("[WARNING concat] All batches are empty, creating empty TensorDict with structure")
+            if data[0].batch is not None:
+                # 기존 배치의 키 구조를 유지하되 크기만 0으로
+                from tensordict import TensorDict
+                empty_dict = {}
+                for key in data[0].batch.keys():
+                    tensor = data[0].batch[key]
+                    # 첫 번째 차원만 0으로, 나머지는 유지
+                    empty_shape = (0,) + tensor.shape[1:]
+                    empty_dict[key] = torch.zeros(empty_shape, dtype=tensor.dtype, device=tensor.device)
+                new_batch = TensorDict(empty_dict, batch_size=[0])
+            else:
+                new_batch = None
+        else:
+            new_batch = torch.cat(batch_lst, dim=0)
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
+        # 모든 키 수집
+        all_keys = set()
+        for d in data:
+            all_keys.update(d.non_tensor_batch.keys())
+
+        # 각 배치의 크기 파악 및 누락된 키 채우기
+        normalized_batches = []
+        for i, d in enumerate(data):
+            batch_dict = d.non_tensor_batch.copy()
+            
+            # 현재 배치의 크기 결정
+            if batch_dict:
+                # 첫 번째 키의 길이를 배치 크기로 사용
+                batch_size = len(next(iter(batch_dict.values())))
+            elif d.batch is not None and 'input_ids' in d.batch:
+                # non_tensor_batch가 비어있으면 tensor batch에서 크기 가져오기
+                batch_size = d.batch['input_ids'].shape[0]
+            else:
+                batch_size = 0
+            
+            # 누락된 키를 None 배열로 채우기
+            for key in all_keys:
+                if key not in batch_dict:
+                    batch_dict[key] = np.array([None] * batch_size, dtype=object)
+                    print(f"[DEBUG concat] Batch {i}: Added missing key '{key}' with {batch_size} None values")
+            
+            normalized_batches.append(batch_dict)
+
+        # 정규화된 배치들을 병합
+        non_tensor_batch = list_of_dict_to_dict_of_list(normalized_batches)
+        
+        # non_tensor_batch 병합 부분
         for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+            try:
+                # 0차원 배열 및 스칼라 처리
+                val_fixed = []
+                for v in val:
+                    if isinstance(v, np.ndarray):
+                        if v.ndim == 0:
+                            val_fixed.append(v.reshape(1))
+                        else:
+                            val_fixed.append(v)
+                    else:
+                        val_fixed.append(np.atleast_1d(v))
+                non_tensor_batch[key] = np.concatenate(val_fixed, axis=0)
+                print(f"[DEBUG concat] After concat key '{key}': final length = {len(non_tensor_batch[key])}")
+            except (ValueError, TypeError) as e:
+                # 실패하면 object array로
+                print(f"[DEBUG concat] Failed to concat key '{key}': {e}, using object array")
+                non_tensor_batch[key] = np.array(val, dtype=object)
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
@@ -957,6 +1042,16 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        # Union of all reward_extra_keys from different batches
+                        if k in merged_meta_info:
+                            if isinstance(v, list) and isinstance(merged_meta_info[k], list):
+                                # Union while preserving order
+                                for item in v:
+                                    if item not in merged_meta_info[k]:
+                                        merged_meta_info[k].append(item)
+                        else:
+                            merged_meta_info[k] = v.copy() if isinstance(v, list) else v
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
