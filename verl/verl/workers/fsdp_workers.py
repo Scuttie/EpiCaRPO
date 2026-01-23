@@ -1030,6 +1030,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
+        print(f"[DEBUG compute_log_prob WORKER] Called!")
+        print(f"[DEBUG compute_log_prob WORKER] _is_actor={self._is_actor}, _is_ref={self._is_ref}")
+        print(f"[DEBUG compute_log_prob WORKER] data is None: {data is None}")
+        if data is not None:
+            print(f"[DEBUG compute_log_prob WORKER] data.batch: {data.batch}")
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1074,7 +1079,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
-
+        print(f"[DEBUG compute_log_prob WORKER] Returning output: {output}")
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
