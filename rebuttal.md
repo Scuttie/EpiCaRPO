@@ -27,11 +27,11 @@ We compare six methods on MATH-500, using Qwen3-8B and Llama-3.1-8B:
 | Qwen3-8B | STaR + TempScaling | 50.00% | 0.7583 | 0.1534 | 0.2433 |
 | Qwen3-8B | STaR + Thermometer | 50.00% | 0.7704 | 0.0620 | 0.1965 |
 | Qwen3-8B | **EpiCaR (ours)** | 48.80% | **0.7991** | 0.1459 | 0.2125 |
-| Qwen3-8B | EpiCaR + TempScaling | 49.80% | **0.8238** | 0.1353 | 0.1956 |
-| Qwen3-8B | EpiCaR + Thermometer | 49.80% | 0.7679 | **0.0578** | **0.1970** |
+| Qwen3-8B | EpiCaR + TempScaling | 49.80% | **0.8238** | 0.1353 | **0.1956** |
+| Qwen3-8B | EpiCaR + Thermometer | 49.80% | 0.7679 | **0.0578** | 0.1970 |
 | Llama3-8B | STaR (raw verbal) | 16.40% | 0.5531 | 0.4585 | 0.3507 |
 | Llama3-8B | STaR + TempScaling | 16.40% | 0.5531 | 0.3491 | 0.2584 |
-| Llama3-8B | STaR + Thermometer | 16.40% | 0.6960 | 0.0456 | 0.1249 |
+| Llama3-8B | STaR + Thermometer | 16.40% | 0.6960 | **0.0456** | 0.1249 |
 | Llama3-8B | **EpiCaR (ours)** | 16.20% | 0.5939 | 0.3887 | 0.2882 |
 | Llama3-8B | EpiCaR + TempScaling | 17.40% | 0.5815 | 0.3318 | 0.2531 |
 | Llama3-8B | EpiCaR + Thermometer | 17.40% | **0.7364** | **0.0595** | **0.1240** |
