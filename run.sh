@@ -26,6 +26,7 @@ fi
 # ---- Configuration ----
 export CUDA_VISIBLE_DEVICES=0,1
 export WANDB_PROJECT="grpo-epicar"
+export WANDB_START_METHOD="thread"
 
 MODEL_NAME="Qwen/Qwen3-4B-Base"
 OUTPUT_DIR="./outputs_grpo_epicar"
