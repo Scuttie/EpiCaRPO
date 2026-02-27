@@ -1,28 +1,24 @@
 #!/bin/bash
 # ============================================================
-# GRPO + EpiCaR (SFT Calibration) Training Script
-# ============================================================
+# GRPO + EpiCaR Training Script
 # Model: Qwen/Qwen3-4B-Base
-# Method: GRPO + Verbalized Confidence SFT
-# GPUs: 2x A100
+# Rollout: vLLM (batched) / GRPO+SFT: PyTorch
+# GPUs: 2x A100 80GB
 # ============================================================
 
 set -e
 
-# ---- Environment ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 export PATH="$HOME/.local/bin:$PATH"
 
-# Activate venv (skip for setup command)
+# Activate venv (skip for setup)
 if [ "${1}" != "setup" ]; then
     if [ -f "${SCRIPT_DIR}/.venv/bin/activate" ]; then
         source "${SCRIPT_DIR}/.venv/bin/activate"
         echo "Activated venv: $(which python)"
     else
-        echo "ERROR: .venv not found. Run setup first:"
-        echo "  cd ${SCRIPT_DIR}"
-        echo "  bash run.sh setup"
+        echo "ERROR: .venv not found. Run: bash run.sh setup"
         exit 1
     fi
 fi
@@ -44,7 +40,7 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 
 # ============================================================
-# Setup: create venv + install deps
+# Setup
 # ============================================================
 run_setup() {
     echo "============================================="
@@ -60,37 +56,27 @@ run_setup() {
     uv venv .venv
     source .venv/bin/activate
 
-    # Step 1: Install torch + build deps first
+    # Step 1: torch + build deps
     uv pip install torch setuptools wheel
 
-    # Step 2: Install flash-attn (needs torch+setuptools at build time)
-    uv pip install flash-attn --no-build-isolation
+    # Step 2: flash-attn (optional, may fail)
+    uv pip install flash-attn --no-build-isolation || echo "flash-attn install failed (OK, using SDPA)"
 
-    # Step 3: Install remaining packages
-    uv pip install \
-        transformers \
-        accelerate \
-        pandas \
-        pyarrow \
-        scikit-learn \
-        matplotlib \
-        wandb \
-        sympy \
-        tqdm
+    # Step 3: vLLM + other deps
+    uv pip install -r requirements.txt
 
     echo ""
-    echo "Setup complete. Now run:"
-    echo "  bash run.sh standalone"
+    echo "Setup complete. Run: bash run.sh standalone"
 }
 
 # ============================================================
-# Standalone Training (nohup background)
+# Standalone Training (vLLM rollout + PyTorch GRPO/SFT)
 # ============================================================
 run_standalone() {
-    LOG_FILE="${LOG_DIR}/train_standalone_${TIMESTAMP}.log"
+    LOG_FILE="${LOG_DIR}/train_${TIMESTAMP}.log"
 
     echo "============================================="
-    echo "Running Standalone GRPO + SFT Calibration"
+    echo "GRPO + SFT Calibration (vLLM rollout)"
     echo "GPUs: ${CUDA_VISIBLE_DEVICES} (2x A100)"
     echo "Log:  ${LOG_FILE}"
     echo "============================================="
@@ -101,6 +87,7 @@ run_standalone() {
         --test_math ${TEST_MATH} \
         --test_amc23 ${TEST_AMC23} \
         --test_aime2025 ${TEST_AIME2025} \
+        --vllm_gpu_util 0.45 \
         --grpo_lr 1e-6 \
         --kl_coeff 0.01 \
         --clip_range 0.2 \
@@ -123,43 +110,42 @@ run_standalone() {
         > "${LOG_FILE}" 2>&1 &
 
     PID=$!
-    echo "${PID}" > "${LOG_DIR}/train_standalone.pid"
+    echo "${PID}" > "${LOG_DIR}/train.pid"
     echo ""
-    echo "Started training in background (PID: ${PID})"
-    echo ""
+    echo "Started (PID: ${PID})"
     echo "  Monitor:  tail -f ${LOG_FILE}"
     echo "  Kill:     kill ${PID}"
-    echo "  Status:   ps -p ${PID}"
 }
 
 # ============================================================
-# VERL-based Training (nohup background)
+# VERL Training (Ray distributed GRPO + SFT callback)
 # ============================================================
 run_verl() {
     LOG_FILE="${LOG_DIR}/train_verl_${TIMESTAMP}.log"
 
     echo "============================================="
-    echo "Running VERL GRPO + SFT Calibration"
+    echo "VERL GRPO + SFT Calibration"
     echo "GPUs: ${CUDA_VISIBLE_DEVICES} (2x A100)"
     echo "Log:  ${LOG_FILE}"
     echo "============================================="
 
-    nohup python -u -m verl.trainer.main_ppo \
+    nohup python -u train_verl.py \
         --config verl_config.yaml \
-        --reward_fn reward_fn.compute_score \
+        --sft_lr 1e-5 \
+        --sft_micro_batch_size 2 \
+        --sft_max_length 1024 \
         > "${LOG_FILE}" 2>&1 &
 
     PID=$!
     echo "${PID}" > "${LOG_DIR}/train_verl.pid"
     echo ""
-    echo "Started training in background (PID: ${PID})"
-    echo ""
+    echo "Started (PID: ${PID})"
     echo "  Monitor:  tail -f ${LOG_FILE}"
     echo "  Kill:     kill ${PID}"
 }
 
 # ============================================================
-# Evaluate a checkpoint (nohup background)
+# Evaluate checkpoint
 # ============================================================
 run_eval() {
     MODEL_PATH=${1:-"${OUTPUT_DIR}/final_model"}
@@ -168,7 +154,6 @@ run_eval() {
 
     echo "============================================="
     echo "Evaluating: ${MODEL_PATH}"
-    echo "GPUs: ${CUDA_VISIBLE_DEVICES}"
     echo "Log:  ${LOG_FILE}"
     echo "============================================="
 
@@ -177,15 +162,13 @@ run_eval() {
         --output_dir ${EVAL_OUTPUT} \
         --max_new_tokens 2048 \
         --max_samples 0 \
-        --use_flash_attn \
         --wandb_project ${WANDB_PROJECT} \
         > "${LOG_FILE}" 2>&1 &
 
     PID=$!
     echo "${PID}" > "${LOG_DIR}/eval.pid"
     echo ""
-    echo "Started eval in background (PID: ${PID})"
-    echo ""
+    echo "Started (PID: ${PID})"
     echo "  Monitor:  tail -f ${LOG_FILE}"
     echo "  Kill:     kill ${PID}"
 }
@@ -194,24 +177,16 @@ run_eval() {
 # Parse command
 # ============================================================
 case "${1:-help}" in
-    setup)
-        run_setup
-        ;;
-    standalone)
-        run_standalone
-        ;;
-    verl)
-        run_verl
-        ;;
-    eval)
-        run_eval "$2" "$3"
-        ;;
+    setup)      run_setup ;;
+    standalone) run_standalone ;;
+    verl)       run_verl ;;
+    eval)       run_eval "$2" "$3" ;;
     *)
         echo "Usage: bash run.sh {setup|standalone|verl|eval}"
         echo ""
-        echo "  setup       - Create .venv and install dependencies"
-        echo "  standalone  - GRPO + SFT training (nohup, 2x A100)"
-        echo "  verl        - VERL framework training (nohup)"
+        echo "  setup       - Create .venv, install torch + vLLM + deps"
+        echo "  standalone  - GRPO + SFT with vLLM rollout (nohup)"
+        echo "  verl        - VERL framework GRPO + SFT (nohup)"
         echo "  eval [path] - Evaluate checkpoint (nohup)"
         exit 1
         ;;
