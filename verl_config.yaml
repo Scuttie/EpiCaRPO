@@ -1,0 +1,80 @@
+# ============================================================
+# VERL GRPO + EpiCaR Training Configuration
+# ============================================================
+# Usage:
+#   python -m verl.trainer.main_ppo --config verl_config.yaml
+# ============================================================
+
+data:
+  train_files: /mnt/chatbot30TB/jewonyeom/verl_qwen3/verl/data/math/train.parquet
+  val_files: /mnt/chatbot30TB/jewonyeom/verl_qwen3/verl/data/math/test.parquet
+  train_batch_size: 64        # batch_size(8) * group_size(8)
+  max_prompt_length: 512
+  max_response_length: 2048
+  filter_overlong_prompts: true
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3-4B-Base
+    override_config:
+      attn_implementation: flash_attention_2
+    enable_gradient_checkpointing: true
+
+  actor:
+    strategy: fsdp
+    optim:
+      lr: 1.0e-6
+      lr_warmup_steps_ratio: 0.05
+      weight_decay: 0.01
+      total_training_steps: -1     # auto-computed
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 8
+    ppo_epochs: 1
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+    grad_clip: 1.0
+    fsdp_config:
+      wrap_policy: size_based
+      min_num_params: 1.0e+7
+      compute_dtype: bf16
+
+  rollout:
+    name: vllm
+    temperature: 0.7
+    top_p: 1.0
+    n: 8                         # group size for GRPO
+    gpu_memory_utilization: 0.4
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 16384
+
+  ref:
+    fsdp_config:
+      wrap_policy: size_based
+      min_num_params: 1.0e+7
+      param_offload: true
+      compute_dtype: bf16
+
+algorithm:
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.01
+  adv_estimator: grpo            # Group Relative Policy Optimization
+  grpo_config:
+    baseline: mean               # group mean baseline
+
+reward_model:
+  reward_fn: reward_fn.compute_score
+  reward_fn_key: data_source
+
+trainer:
+  total_epochs: 3
+  save_freq: 100
+  test_freq: 50
+  project_name: grpo-epicar
+  experiment_name: qwen3_4b_grpo_epicar
+  logger:
+    - wandb
+  default_local_dir: ./outputs_grpo_epicar
+  default_hdfs_dir: null
+  n_gpus_per_node: 4
+  nnodes: 1
