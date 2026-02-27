@@ -105,12 +105,17 @@ def collate_fn(batch, pad_token_id=0):
 
 
 class SFTCalibrationTrainer:
+    """
+    Trains the model to predict A (correct) / B (incorrect) after solution generation.
+    Designed to be called after each GRPO rollout batch.
+    """
+
     def __init__(
         self,
         model,
         tokenizer,
-        optimizer, # ✅ 새롭게 추가된 파라미터
-        lr: float = 1e-6,
+        optimizer=None,
+        lr: float = 1e-5,
         sft_epochs: int = 1,
         sft_batch_size: int = 4,
         sft_grad_accum: int = 4,
@@ -119,13 +124,20 @@ class SFTCalibrationTrainer:
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.optimizer = optimizer # ✅ 주입받은 Optimizer 할당
         self.lr = lr
         self.sft_epochs = sft_epochs
         self.sft_batch_size = sft_batch_size
         self.sft_grad_accum = sft_grad_accum
         self.max_length = max_length
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Use provided optimizer or create new one
+        if optimizer is not None:
+            self.optimizer = optimizer
+        else:
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(), lr=self.lr, weight_decay=0.01
+            )
 
     def train_on_rollouts(
         self,
