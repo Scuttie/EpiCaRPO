@@ -1,0 +1,138 @@
+# ============================================================
+# VERL GRPO + EpiCaR Training — 8× B200 Configuration
+# ============================================================
+# Model: Qwen/Qwen3-4B-Base (~8GB bf16)
+# No critic (GRPO doesn't use a value network)
+# No reward model (rule-based reward via compute_score)
+# ============================================================
+
+data:
+  train_files: /home/jewonyeom/verl/data/math/train.parquet
+  val_files: /home/jewonyeom/verl/data/math/test.parquet
+  train_batch_size: 256
+  max_prompt_length: 512
+  max_response_length: 2048
+  filter_overlong_prompts: true
+  trust_remote_code: true
+  shuffle: true
+
+actor_rollout_ref:
+  hybrid_engine: true
+
+  model:
+    path: Qwen/Qwen3-4B-Base
+    override_config:
+      attn_implementation: flash_attention_2
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+
+  actor:
+    strategy: fsdp
+    ppo_mini_batch_size: 256
+    ppo_micro_batch_size_per_gpu: 4
+    use_dynamic_bsz: false
+    ppo_epochs: 1
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+    use_kl_loss: true
+    kl_loss_coef: 0.01
+    kl_loss_type: low_var_kl
+    grad_clip: 1.0
+    loss_agg_mode: token-mean
+    use_torch_compile: false
+    shuffle: false
+    optim:
+      lr: 1.0e-6
+      lr_warmup_steps_ratio: 0.05
+      min_lr_ratio: 0.0
+      warmup_style: constant
+      weight_decay: 0.01
+      total_training_steps: -1
+    fsdp_config:
+      wrap_policy:
+        min_num_params: 1.0e+7
+      param_offload: false
+      optimizer_offload: false
+
+  rollout:
+    name: vllm
+    mode: sync
+    temperature: 0.7
+    top_p: 1.0
+    top_k: -1
+    n: 8
+    gpu_memory_utilization: 0.5
+    tensor_model_parallel_size: 1
+    max_num_batched_tokens: 16384
+    enforce_eager: true
+    free_cache_engine: true
+    load_format: dummy_dtensor
+    do_sample: true
+    disable_log_stats: true
+    enable_chunked_prefill: true
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    val_kwargs:
+      top_k: -1
+      top_p: 1.0
+      temperature: 0
+      n: 1
+      do_sample: false
+    multi_turn:
+      enable: false
+
+  ref:
+    fsdp_config:
+      param_offload: true
+      wrap_policy:
+        min_num_params: 1.0e+7
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  gamma: 1.0
+  lam: 1.0
+  use_kl_in_reward: false
+  kl_penalty: kl
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.01
+
+critic:
+  strategy: fsdp
+  optim:
+    lr: 1e-5
+    weight_decay: 0.01
+    total_training_steps: -1
+  model:
+    path: ${actor_rollout_ref.model.path}
+    enable_gradient_checkpointing: true
+    trust_remote_code: true
+
+reward_model:
+  enable: false
+
+custom_reward_function:
+  path: ./reward_fn.py
+  name: compute_score
+
+trainer:
+  balance_batch: true
+  total_epochs: 3
+  save_freq: 100
+  test_freq: 50
+  project_name: grpo-epicar
+  experiment_name: qwen3_4b_grpo_epicar_8gpu
+  logger:
+    - console
+    - wandb
+  default_local_dir: ./outputs_grpo_epicar_verl
+  default_hdfs_dir: null
+  n_gpus_per_node: 8
+  nnodes: 1
+  critic_warmup: 0
+  val_before_train: true
+  device: cuda
+
+ray_init:
+  num_cpus: 32
