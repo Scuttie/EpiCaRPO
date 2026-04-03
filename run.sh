@@ -175,18 +175,69 @@ run_eval() {
 }
 
 # ============================================================
+# Fast Training (optimizer state preserved across steps)
+# ============================================================
+run_fast() {
+    LOG_FILE="${LOG_DIR}/train_fast_${TIMESTAMP}.log"
+
+    echo "============================================="
+    echo "GRPO + SFT Calibration (vLLM Server Mode)"
+    echo "GPUs: ${CUDA_VISIBLE_DEVICES} (GPU0=train, GPU1=vllm+ref)"
+    echo "Log:  ${LOG_FILE}"
+    echo "============================================="
+
+    nohup python -u train_fast.py \
+        --model_name ${MODEL_NAME} \
+        --train_data ${TRAIN_DATA} \
+        --test_math ${TEST_MATH} \
+        --test_amc23 ${TEST_AMC23} \
+        --test_aime2025 ${TEST_AIME2025} \
+        --vllm_gpu_util 0.65 \
+        --vllm_refresh_every ${2:-5} \
+        --grpo_lr 1e-6 \
+        --kl_coeff 0.01 \
+        --clip_range 0.2 \
+        --group_size 8 \
+        --temperature 0.7 \
+        --max_new_tokens 2048 \
+        --grpo_grad_accum 4 \
+        --sft_lr 1e-5 \
+        --sft_epochs 1 \
+        --sft_batch_size 2 \
+        --sft_grad_accum 4 \
+        --num_epochs 3 \
+        --batch_size 8 \
+        --eval_every 50 \
+        --save_every 100 \
+        --eval_samples 100 \
+        --output_dir ${OUTPUT_DIR} \
+        --wandb_project ${WANDB_PROJECT} \
+        --wandb_run_name "qwen3_4b_fast_${TIMESTAMP}" \
+        > "${LOG_FILE}" 2>&1 &
+
+    PID=$!
+    echo "${PID}" > "${LOG_DIR}/train_fast.pid"
+    echo ""
+    echo "Started (PID: ${PID})"
+    echo "  Monitor:  tail -f ${LOG_FILE}"
+    echo "  Kill:     kill ${PID}"
+}
+
+# ============================================================
 # Parse command
 # ============================================================
 case "${1:-help}" in
     setup)      run_setup ;;
     standalone) run_standalone ;;
+    fast)       run_fast ;;
     verl)       run_verl ;;
     eval)       run_eval "$2" "$3" ;;
     *)
-        echo "Usage: bash run.sh {setup|standalone|verl|eval}"
+        echo "Usage: bash run.sh {setup|standalone|fast|verl|eval}"
         echo ""
         echo "  setup       - Create .venv, install torch + vLLM + deps"
-        echo "  standalone  - GRPO + SFT with vLLM rollout (nohup)"
+        echo "  standalone  - GRPO + SFT with vLLM rollout [slow] (nohup)"
+        echo "  fast        - GRPO + SFT with vLLM server [recommended] (nohup)"
         echo "  verl        - VERL framework GRPO + SFT (nohup)"
         echo "  eval [path] - Evaluate checkpoint (nohup)"
         exit 1
